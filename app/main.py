@@ -1,4 +1,3 @@
-
 import re
 from pathlib import Path
 import json
@@ -11,12 +10,31 @@ from seleniumbase import SB
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import random
+import logging
+import sys
 
 from fastapi import FastAPI
 from typing import Optional
 
+log_dir = Path('app/logs')
+log_dir.mkdir(parents=True, exist_ok=True)
+log_file_path = log_dir / 'scraper.log'
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(log_file_path, encoding='utf-8'), # Запис у файл
+        logging.StreamHandler(sys.stdout)                     # Вивід у консоль
+    ]
+)
+logger = logging.getLogger("CopartScraper")
+# ---------------------
+
 tech_json_path = Path('app/tech_json')
 res_json_path = Path('app/res_json')
+tech_json_path.mkdir(parents=True, exist_ok=True)
+res_json_path.mkdir(parents=True, exist_ok=True)
 SESSION = requests.Session()
 POST_COUNT = 0
 POST_LIMITER = 1000  # Number of POST requests before refreshing
@@ -84,103 +102,118 @@ def kill_chrome_processes():
             pass
 
 def get_copart_session_data(headless=False):
-    """
-    Launches a browser (UC mode), bypasses Cloudflare/CAPTCHA,
-    and returns a dictionary of cookies and headers.
-    """
     kill_chrome_processes()
 
-    # Base structure for the result
     data = {
         "cookies": {},
         "headers": {
             "User-Agent": "",
             "X-XSRF-TOKEN": "",
-            "X-Requested-With": "XMLHttpRequest", # Critical for Copart POST requests
+            "X-Requested-With": "XMLHttpRequest",
             "Content-Type": "application/json;charset=UTF-8"
         }
     }
-
-    # uc=True is mandatory for Cloudflare bypass
-    # with SB(uc=True, incognito=True, test=True, headless=headless) as sb:
 
     with SB(uc=True, incognito=True, headless=headless, user_data_dir=None) as sb:
         try:
             sb.open("https://www.copart.com/vehicleFinder")
 
-            # --- Smart Wait Logic ---
-            # Loops for up to 60s to ensure page is fully loaded and CAPTCHA is solved
-            page_loaded = False
-            for _ in range(60):
-                # Check for success indicators (URL or Element)
-                if "vehicle" in sb.get_current_url().lower() and \
-                   (sb.is_element_visible('#serverSideDataTable') or sb.is_element_visible('.inner-wrap')):
-                    page_loaded = True
+            MAX_RELOADS = 5
+            reload_count = 0
+            page_ready = False
+
+            while reload_count < MAX_RELOADS and not page_ready:
+                start = time.time()
+
+                # Чекаємо до 5 секунд на стабілізацію
+                while time.time() - start < 5:
+                    if (
+                        "vehicle" in sb.get_current_url().lower()
+                        and (
+                            sb.is_element_visible("#serverSideDataTable")
+                            or sb.is_element_visible(".inner-wrap")
+                        )
+                    ):
+                        page_ready = True
+                        break
+
+                    if sb.is_element_visible('iframe[src*="cloudflare"]'):
+                        sb.uc_gui_click_captcha()
+
+                    time.sleep(1)
+
+                if page_ready:
                     break
 
-                # Auto-solve Cloudflare checkbox if visible
-                if sb.is_element_visible('iframe[src*="cloudflare"]'):
-                    sb.uc_gui_click_captcha()
+                reload_count += 1
+                wait_time = 10 if reload_count > 1 else 0
+                logger.info(f"[Copart] Cookies not ready → reload #{reload_count}, wait {wait_time}s")
 
-                time.sleep(3)
+                time.sleep(wait_time)
+                sb.refresh()
 
-            if not page_loaded:
-                raise TimeoutError("Copart page failed to load (Cloudflare or Timeout).")
+            if not page_ready:
+                raise TimeoutError("Page loaded but cookies never stabilized")
 
-            time.sleep(2) # Stabilization time for final cookies
+            # Даємо сторінці фінальні 1–2 секунди
+            time.sleep(2)
 
-            # --- Data Extraction ---
-            # 1. User Agent
+            # ===== ЗАБИРАЄМО USER AGENT =====
             data["headers"]["User-Agent"] = sb.get_user_agent()
 
-            # 2. Cookies (via CDP for completeness)
+            # ===== ЗАБИРАЄМО COOKIES =====
             cookies_data = sb.cdp.get_all_cookies()
+
             cookie_dict = {}
             xsrf_token = None
 
-            for cookie in cookies_data:
-                # Handle SeleniumBase object vs dict differences
-                if isinstance(cookie, dict):
-                    name = cookie.get('name', '')
-                    value = cookie.get('value', '')
+            for c in cookies_data:
+                # Цей блок коду працює і з об'єктами, і зі словниками
+                if isinstance(c, dict):
+                    name = c.get("name")
+                    value = c.get("value")
                 else:
-                    name = getattr(cookie, 'name', '')
-                    value = getattr(cookie, 'value', '')
+                    # Якщо це об'єкт Cookie, беремо атрибути напряму
+                    name = getattr(c, "name", None)
+                    value = getattr(c, "value", None)
 
-                if name:
-                    cookie_dict[name] = value
-                    # Capture XSRF token if found in cookies
-                    if 'xsrf' in name.lower() or 'csrf' in name.lower():
-                        xsrf_token = value
+                if not name:
+                    continue
+
+                # Зберігаємо в простий словник, який точно запишеться в JSON
+                cookie_dict[name] = value
+
+                if "xsrf" in name.lower() or "csrf" in name.lower():
+                    xsrf_token = value
+
+            if not cookie_dict:
+                raise RuntimeError("No cookies found via CDP")
+
+            if not xsrf_token:
+                 # Іноді токен не в куках, а в заголовках, але Copart зазвичай тримає в XSRF-TOKEN куці
+                 logger.warning("XSRF token missing in cookies collection.")
+                 # Можна спробувати не падати, а повернути те що є, але POST запити можуть не пройти
+                 # raise RuntimeError("Cookies fetched but XSRF token missing")
 
             data["cookies"] = cookie_dict
-
-            # 3. XSRF Token (Check Cookies -> then LocalStorage)
             if xsrf_token:
                 data["headers"]["X-XSRF-TOKEN"] = xsrf_token
-            else:
-                try:
-                    ls = sb.execute_script("return window.localStorage;")
-                    for k, v in ls.items():
-                        if 'xsrf' in k.lower():
-                            data["headers"]["X-XSRF-TOKEN"] = v
-                            break
-                except: pass
 
             return data
 
         except Exception as e:
-            print(f"Error fetching Copart session data: {e}")
+            logger.error(f"[Copart] Session fetch failed: {e}")
             save_error({
-                'error_type': f"get_copart_session_data() Exception: {e}"
+                "error_type": f"get_copart_session_data error: {e}"
             })
             return None
+
 
 def refresh_copart_session(headless=False):
     """
     Helper function to update the global SESSION object with a strict timeout.
     """
-    print("taking cookies and headers")
+    logger.info("taking cookies and headers")
     global SESSION
 
     # Внутрішня функція для запуску в окремому потоці
@@ -194,11 +227,11 @@ def refresh_copart_session(headless=False):
         # Логіка сну (як у вашому коді), але пропускаємо сон для першої спроби (counter=0)
         if session_retry_counter > 0:
             sleep_time = 120 if session_retry_counter <= 3 else 300
-            print(f"Waiting {sleep_time}s before retry...")
+            logger.info(f"Waiting {sleep_time}s before retry...")
             time.sleep(sleep_time)
 
         session_retry_counter += 1
-        print(f"Attempt to take cookies and headers #{session_retry_counter}")
+        logger.info(f"Attempt to take cookies and headers #{session_retry_counter}")
 
         # Гарантовано вбиваємо процеси перед стартом, щоб мати чистий стан
         kill_chrome_processes()
@@ -213,7 +246,7 @@ def refresh_copart_session(headless=False):
             executor.shutdown(wait=True)
 
         except TimeoutError:
-            print(f"TIMEOUT: get_copart_session_data took longer than 60s.")
+            logger.error(f"TIMEOUT: get_copart_session_data took longer than 60s.")
 
             # 1. Спочатку вбиваємо Chrome, щоб спробувати "розморозити" потік
             kill_chrome_processes()
@@ -225,13 +258,13 @@ def refresh_copart_session(headless=False):
             session_data = None
 
         except Exception as e:
-            print(f"Error executing session update: {e}")
+            logger.error(f"Error executing session update: {e}")
             executor.shutdown(wait=False) # На випадок інших помилок теж не чекаємо
             session_data = None
 
     # Якщо ми вийшли з циклу, значить session_data отримано
     if session_data:
-        print("session refreshed successfully")
+        logger.info("session refreshed successfully")
         # Оновлюємо глобальну сесію під замком, якщо потрібно (хоча ви викликаєте це в одному потоці)
         with SESSION_LOCK:
             # === ГОЛОВНА ЗМІНА ТУТ ===
@@ -260,7 +293,7 @@ def safe_get(url, **kwargs):
     # Використовуємо той самий лічильник, що і для POST, щоб освіжати сесію
     with SESSION_LOCK:
         if POST_COUNT >= POST_LIMITER:
-            print(f"[SafeGet] Limit {POST_LIMITER} reached. Refreshing session...")
+            logger.info(f"[SafeGet] Limit {POST_LIMITER} reached. Refreshing session...")
             if not refresh_copart_session():
                 raise RuntimeError("Failed to refresh session.")
             POST_COUNT = 0
@@ -278,7 +311,7 @@ def safe_get(url, **kwargs):
 
             # Якщо 404 - це означає лот не знайдено (видалений). Це НЕ помилка сесії.
             if response.status_code == 404:
-                print(f"[SafeGet] 404 Not Found for {url} (Lot might be removed)")
+                logger.info(f"[SafeGet] 404 Not Found for {url} (Lot might be removed)")
                 return response # Повертаємо як є, обробимо зовні
 
             # М'який блок (200 OK, але HTML)
@@ -287,7 +320,7 @@ def safe_get(url, **kwargs):
             # Помилки, що вимагають оновлення сесії
             if response.status_code in [403, 429, 503] or is_soft_block:
                 reason = "Soft Block (HTML)" if is_soft_block else f"Status {response.status_code}"
-                print(f"[SafeGet] Issue: {reason}. Attempt {attempt+1}/5. Refreshing...")
+                logger.warning(f"[SafeGet] Issue: {reason}. Attempt {attempt+1}/5. Refreshing...")
 
                 with SESSION_LOCK:
                     time.sleep(random.uniform(2, 4))
@@ -296,14 +329,14 @@ def safe_get(url, **kwargs):
                 continue
 
         except requests.exceptions.ConnectionError:
-            print(f"[SafeGet] Connection error, retry {attempt+1}/5")
+            logger.error(f"[SafeGet] Connection error, retry {attempt+1}/5")
             time.sleep(5)
         except Exception as e:
-             print(f"[SafeGet] Request error: {e}")
+             logger.error(f"[SafeGet] Request error: {e}")
              with SESSION_LOCK:
                  refresh_copart_session()
 
-    print("[SafeGet] Failed after 5 retries.")
+    logger.error("[SafeGet] Failed after 5 retries.")
     dummy = requests.Response()
     dummy.status_code = 500
     dummy._content = b"{}"
@@ -319,7 +352,7 @@ def safe_post(url, **kwargs):
     # 1. Перевірка лічильника (стандартна процедура)
     with SESSION_LOCK:
         if POST_COUNT >= POST_LIMITER:
-            print(f"[SafePost] Limit {POST_LIMITER} reached. Refreshing session...")
+            logger.info(f"[SafePost] Limit {POST_LIMITER} reached. Refreshing session...")
             if not refresh_copart_session():
                 raise RuntimeError("Failed to refresh session.")
             POST_COUNT = 0
@@ -328,9 +361,9 @@ def safe_post(url, **kwargs):
     # 2. Виконуємо запит з логікою "Refresh on Error"
     for attempt in range(5):
         try:
-            # print(f"[SafePost] Sending request (Attempt {attempt+1})...")
+            # logger.info(f"[SafePost] Sending request (Attempt {attempt+1})...")
             response = SESSION.post(url, **kwargs)
-            # print(f"[SafePost] Received response: {response.status_code}")
+            # logger.info(f"[SafePost] Received response: {response.status_code}")
 
             # Якщо успіх (200) - перевіряємо, чи це дійсно JSON, а не сторінка блокування Cloudflare
             content_type = response.headers.get("Content-Type", "")
@@ -344,7 +377,7 @@ def safe_post(url, **kwargs):
 
             # Якщо помилка 403 (Forbidden) або 429 (Too Many Requests) або 503
             if response.status_code in [403, 429, 503] or is_soft_block:
-                print(f"[SafePost] Got status {response.status_code}. Attempt {attempt+1}/5. Forcing Refresh...")
+                logger.warning(f"[SafePost] Got status {response.status_code}. Attempt {attempt+1}/5. Forcing Refresh...")
 
                 # Блокуємо, щоб інші потоки почекали
                 with SESSION_LOCK:
@@ -356,16 +389,16 @@ def safe_post(url, **kwargs):
                 continue # Йдемо на наступну ітерацію циклу (повторний запит)
 
         except requests.exceptions.ConnectionError:
-            print(f"[SafePost] Connection error, retry {attempt+1}/5")
+            logger.error(f"[SafePost] Connection error, retry {attempt+1}/5")
             time.sleep(5)
         except Exception as e:
-             print(f"[SafePost] Request error: {e}")
+             logger.error(f"[SafePost] Request error: {e}")
              # Якщо сталася дивна помилка, теж спробуємо оновитись на всяк випадок
              with SESSION_LOCK:
                  refresh_copart_session()
 
     # Якщо після 5 спроб і оновлень нічого не вийшло
-    print("[SafePost] Failed after 5 retries.")
+    logger.error("[SafePost] Failed after 5 retries.")
     # Повертаємо dummy об'єкт з кодом 500, щоб програма не крашилась, а просто пропускала лот
     dummy = requests.Response()
     dummy.status_code = 500
@@ -394,10 +427,10 @@ def fetch_build_sheet(lot_number, lot_hash):
              # Build sheet not found - it's normal for some lots
             return None
         else:
-            print(f"[BuildSheet] Error {r.status_code} for lot {lot_number}")
+            logger.error(f"[BuildSheet] Error {r.status_code} for lot {lot_number}")
             return None
     except Exception as e:
-        print(f"[BuildSheet] Exception for lot {lot_number}: {e}")
+        logger.error(f"[BuildSheet] Exception for lot {lot_number}: {e}")
         return None
 
 
@@ -417,7 +450,7 @@ def get_lot_details(number: int):
     r = safe_get(url, timeout = 30)
 
     if r.status_code != 200:
-        print(f"Error {r.status_code} for lot {number}")
+        logger.error(f"Error {r.status_code} for lot {number}")
         return
 
     try:
@@ -437,7 +470,7 @@ def get_lot_details(number: int):
             if build_sheet_data:
                 data['build_sheet'] = build_sheet_data
             else:
-                print(f"Error. get_lot_details build-sheet returned None")
+                logger.error(f"Error. get_lot_details build-sheet returned None")
                 save_error({
                     'error_type': f"Error. get_lot_details build-sheet returned None"
                 })
@@ -451,7 +484,7 @@ def get_lot_details(number: int):
     except Exception as e:
         # Якщо ми тут, значить safe_post повернув 200 OK, але це НЕ JSON.
         # Це 100% блок від Cloudflare. Треба оновлюватись.
-        print(f"JSON Error for lot {number} : {e} (Likely soft-block). Triggering refresh...")
+        logger.error(f"JSON Error for lot {number} : {e} (Likely soft-block). Triggering refresh...")
         with SESSION_LOCK:
             # Перевіряємо, може хтось вже оновив поки ми спали
             refresh_copart_session()
