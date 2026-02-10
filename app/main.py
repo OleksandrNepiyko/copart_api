@@ -24,21 +24,48 @@ POST_LIMITER = 1000  # Number of POST requests before refreshing
 
 SESSION_LOCK = threading.RLock()
 
-PROXY_HOST = "109.236.80.2"
-PROXY_PORT = "15259"
-PROXY_USER = None
-PROXY_PASS = None
-
-if PROXY_USER and PROXY_PASS:
-    PROXY_STRING = f"{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-else:
-    PROXY_STRING = f"{PROXY_HOST}:{PROXY_PORT}"
-
 # Global Session Object
 # This acts as the "bridge" between the token extractor and safe_post.
 SESSION = requests.Session()
 
 app = FastAPI()
+
+SESSION_FILE = Path("app/session/copart_session.json")
+SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+def save_session_to_file(headers, cookies):
+    data = {
+        "saved_at": datetime.now().isoformat(),
+        "headers": headers,
+        "cookies": cookies
+    }
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def load_session_from_file():
+    if not SESSION_FILE.exists():
+        return False
+
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        headers = data.get("headers")
+        cookies = data.get("cookies")
+
+        if not headers or not cookies:
+            return False
+
+        global SESSION
+        SESSION = requests.Session()
+        SESSION.headers.update(headers)
+        SESSION.cookies.update(cookies)
+
+        return True
+
+    except Exception:
+        return False
+
 
 def save_error(error_obj):
     #if an error occurs it should be saved here (only problems in automatic part of the program will be saved)
@@ -63,8 +90,6 @@ def get_copart_session_data(headless=False):
     """
     kill_chrome_processes()
 
-    my_proxy = "109.236.80.2:15259"
-
     # Base structure for the result
     data = {
         "cookies": {},
@@ -79,8 +104,7 @@ def get_copart_session_data(headless=False):
     # uc=True is mandatory for Cloudflare bypass
     # with SB(uc=True, incognito=True, test=True, headless=headless) as sb:
 
-    with SB(uc=True, incognito=True, headless=headless, proxy=PROXY_STRING) as sb:
-    # with SB(uc=True, incognito=True, headless=headless) as sb:
+    with SB(uc=True, incognito=True, headless=headless, user_data_dir=None) as sb:
         try:
             sb.open("https://www.copart.com/vehicleFinder")
 
@@ -98,7 +122,7 @@ def get_copart_session_data(headless=False):
                 if sb.is_element_visible('iframe[src*="cloudflare"]'):
                     sb.uc_gui_click_captcha()
 
-                time.sleep(1)
+                time.sleep(3)
 
             if not page_loaded:
                 raise TimeoutError("Copart page failed to load (Cloudflare or Timeout).")
@@ -183,7 +207,9 @@ def refresh_copart_session(headless=False):
         future = executor.submit(_get_session_task)
 
         try:
+            time.sleep(2)
             session_data = future.result(timeout=60)
+            time.sleep(2) # Stabilization time after successful fetch
             executor.shutdown(wait=True)
 
         except TimeoutError:
@@ -213,14 +239,13 @@ def refresh_copart_session(headless=False):
             # Це вбиває всі старі завислі TCP-пули.
             SESSION = requests.Session()
 
-            proxies = {
-                "http": f"http://{PROXY_STRING}",
-                "https": f"http://{PROXY_STRING}",
-            }
-            SESSION.proxies.update(proxies)
-
             SESSION.headers.update(session_data['headers'])
             SESSION.cookies.update(session_data['cookies'])
+            time.sleep(2)
+            save_session_to_file(
+                session_data["headers"],
+                session_data["cookies"]
+            )
         return True
 
     return False
@@ -385,6 +410,7 @@ def test_endpoint():
 
 @app.get("/lot/{number}")
 def get_lot_details(number: int):
+    load_session_from_file()
 
     url = f"https://www.copart.com/public/data/lotdetails/solr/{number}"
 

@@ -15,4 +15,5 @@ __pycache__/
 venv/
 code_and_files_that_are_not_used_in_program/
 *.sql
+*.json
 request_data_extractor.py
