@@ -15,8 +15,8 @@ COL_JSON_SOURCE = 'json_of_lot'
 COL_IMAGES = 'images'
 
 # Налаштування для розподілу між 3 ноутами:
-START_ID = 0
-END_ID = 100000  # На другому ноуті зміни на 200000, на віртуалці на 300000
+START_ID = 300000
+END_ID = 10000000  # На другому ноуті зміни на 200000, на віртуалці на 300000
 
 BATCH_SIZE = 500
 TEST_LIMIT = 5   # ЗАКОМЕНТУЙ ЦЕЙ РЯДОК ДЛЯ ПОВНОГО ЗАПУСКУ: # TEST_LIMIT = None
@@ -312,7 +312,8 @@ def run_migration():
 
                         p = parse_iaai_to_pydantic(raw_dict)
 
-                        if not p.vin: continue
+                        if not p.vin or str(p.vin).strip() == "":
+							p.vin = None
 
                         # 1. Заповнюємо довідники і отримуємо ID
                         make_id = cache.get_id('ref_makes', 'name', p.make_name)
